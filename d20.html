@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>D20 Roller - Drag & Throw</title>
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+      }
+      #root {
+        width: 100vw;
+        height: 100vh;
+        position: relative;
+      }
+      button {
+        position: absolute;
+        top: 20px;
+        left: 20px;
+        z-index: 10;
+        padding: 10px 20px;
+        font-size: 16px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    
+    <!-- Import cannon‑es as an ES module and attach to window -->
+    <script type="module">
+      import * as CANNON from "https://cdn.skypack.dev/cannon-es";
+      window.CANNON = CANNON;
+    </script>
+    
+    <!-- React and ReactDOM -->
+    <script src="https://unpkg.com/react@17/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@17/umd/react-dom.development.js"></script>
+    <!-- Three.js -->
+    <script src="https://unpkg.com/three@0.150.1/build/three.min.js"></script>
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+    
+    <script type="text/babel">
+      const { useRef, useEffect } = React;
+      
+      function D20Roller() {
+        const mountRef = useRef(null);
+        const diceMeshRef = useRef(null);
+        const diceBodyRef = useRef(null);
+        
+        // Refs for dragging state
+        const isDraggingRef = useRef(false);
+        const dragPlaneRef = useRef(null);
+        const dragOffsetRef = useRef(new THREE.Vector3());
+        const lastDragPosRef = useRef(new THREE.Vector3());
+        const lastDragTimeRef = useRef(0);
+      
+        useEffect(() => {
+          // --- Three.js Scene Setup ---
+          const scene = new THREE.Scene();
+          const camera = new THREE.PerspectiveCamera(
+            45,
+            window.innerWidth / window.innerHeight,
+            0.1,
+            100
+          );
+          camera.position.set(0, 5, 8);
+          camera.lookAt(0, 0, 0);
+          
+          const renderer = new THREE.WebGLRenderer({ antialias: true });
+          renderer.setSize(window.innerWidth, window.innerHeight);
+          renderer.setPixelRatio(window.devicePixelRatio);
+          renderer.shadowMap.enabled = true;
+          mountRef.current.appendChild(renderer.domElement);
+          
+          // --- Lights ---
+          const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+          scene.add(ambientLight);
+          const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+          directionalLight.position.set(5, 10, 7.5);
+          directionalLight.castShadow = true;
+          scene.add(directionalLight);
+          
+          // --- Floor ---
+          const floorGeo = new THREE.PlaneGeometry(20, 20);
+          const floorMat = new THREE.MeshPhongMaterial({ color: 0x808080 });
+          const floorMesh = new THREE.Mesh(floorGeo, floorMat);
+          floorMesh.rotation.x = -Math.PI / 2;
+          floorMesh.position.y = -1;
+          floorMesh.receiveShadow = true;
+          scene.add(floorMesh);
+          
+          // --- Physics Setup (cannon‑es) ---
+          const world = new CANNON.World({
+            gravity: new CANNON.Vec3(0, -9.82, 0)
+          });
+          const floorBody = new CANNON.Body({ mass: 0 });
+          floorBody.addShape(new CANNON.Plane());
+          floorBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+          floorBody.position.set(0, -1, 0);
+          world.addBody(floorBody);
+          
+          // --- Create the D20 Dice (Icosahedron) ---
+          const diceRadius = 0.8;
+          let diceGeometry = new THREE.IcosahedronGeometry(diceRadius, 0);
+          diceGeometry = diceGeometry.toNonIndexed();
+          diceGeometry.computeVertexNormals();
+          const diceMaterial = new THREE.MeshPhongMaterial({
+            color: 0xffffff,
+            flatShading: true
+          });
+          const diceMesh = new THREE.Mesh(diceGeometry, diceMaterial);
+          diceMesh.castShadow = true;
+          diceMesh.position.set(0, 2, 0);
+          scene.add(diceMesh);
+          diceMeshRef.current = diceMesh;
+          
+          // --- Attach Face Labels ---
+          const labelGroup = new THREE.Group();
+          const posAttr = diceGeometry.attributes.position;
+          const faceCount = posAttr.count / 3;
+          for (let i = 0; i < faceCount; i++) {
+            const idx = i * 3;
+            const vA = new THREE.Vector3().fromBufferAttribute(posAttr, idx);
+            const vB = new THREE.Vector3().fromBufferAttribute(posAttr, idx + 1);
+            const vC = new THREE.Vector3().fromBufferAttribute(posAttr, idx + 2);
+            const center = new THREE.Vector3().addVectors(vA, vB).add(vC).divideScalar(3);
+            const cb = new THREE.Vector3().subVectors(vC, vB);
+            const ab = new THREE.Vector3().subVectors(vA, vB);
+            const normal = new THREE.Vector3().crossVectors(cb, ab).normalize();
+            const label = createLabelMesh(i + 1);
+            label.position.copy(center.clone().add(normal.clone().multiplyScalar(0.01)));
+            label.lookAt(center.clone().add(normal));
+            labelGroup.add(label);
+          }
+          diceMesh.add(labelGroup);
+          
+          // --- Create Physics Body for Dice ---
+          const physVertices = [];
+          for (let i = 0; i < posAttr.count; i++) {
+            physVertices.push(new CANNON.Vec3(
+              posAttr.getX(i),
+              posAttr.getY(i),
+              posAttr.getZ(i)
+            ));
+          }
+          const physFaces = [];
+          for (let i = 0; i < faceCount; i++) {
+            physFaces.push([i * 3, i * 3 + 1, i * 3 + 2]);
+          }
+          const diceShape = new CANNON.ConvexPolyhedron({
+            vertices: physVertices,
+            faces: physFaces
+          });
+          const diceBody = new CANNON.Body({
+            mass: 1,
+            shape: diceShape,
+            position: new CANNON.Vec3(0, 2, 0),
+            angularDamping: 0.1
+          });
+          world.addBody(diceBody);
+          diceBodyRef.current = diceBody;
+          
+          // --- Animation Loop ---
+          let lastTime;
+          function animate(time) {
+            requestAnimationFrame(animate);
+            const dt = lastTime ? (time - lastTime) / 1000 : 0;
+            lastTime = time;
+            world.step(1 / 60, dt);
+            // Only update position if not dragging (when dragging, our mouse events override it)
+            if (!isDraggingRef.current) {
+              diceMesh.position.copy(diceBody.position);
+              diceMesh.quaternion.copy(diceBody.quaternion);
+            }
+            renderer.render(scene, camera);
+          }
+          animate();
+          
+          // --- Mouse Interaction for Drag & Throw ---
+          const raycaster = new THREE.Raycaster();
+          const mouse = new THREE.Vector2();
+          
+          function getMouseNDC(event) {
+            const rect = mountRef.current.getBoundingClientRect();
+            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+          }
+          
+          function onMouseDown(event) {
+            getMouseNDC(event);
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(diceMesh);
+            if (intersects.length > 0) {
+              // Start dragging
+              isDraggingRef.current = true;
+              // Create a horizontal drag plane at the dice's current height.
+              dragPlaneRef.current = new THREE.Plane(new THREE.Vector3(0, 1, 0), -diceMesh.position.y);
+              // Compute offset: dice position minus intersection point.
+              dragOffsetRef.current.copy(diceMesh.position).sub(intersects[0].point);
+              // Record initial drag position and time.
+              lastDragPosRef.current.copy(intersects[0].point);
+              lastDragTimeRef.current = performance.now();
+              // Temporarily disable physics on the dice by making it static.
+              diceBody.mass = 0;
+              diceBody.updateMassProperties();
+            }
+          }
+          
+          function onMouseMove(event) {
+            if (!isDraggingRef.current) return;
+            getMouseNDC(event);
+            raycaster.setFromCamera(mouse, camera);
+            const plane = dragPlaneRef.current;
+            const intersectionPoint = new THREE.Vector3();
+            raycaster.ray.intersectPlane(plane, intersectionPoint);
+            if (intersectionPoint) {
+              // New desired position is the intersection plus the offset.
+              const newPos = intersectionPoint.clone().add(dragOffsetRef.current);
+              // Update dice physics body and mesh positions.
+              diceBody.position.set(newPos.x, newPos.y, newPos.z);
+              diceMesh.position.copy(newPos);
+              
+              // For throw impulse calculation, record movement delta.
+              const now = performance.now();
+              lastDragPosRef.current.copy(intersectionPoint);
+              lastDragTimeRef.current = now;
+            }
+          }
+          
+          function onMouseUp(event) {
+            if (!isDraggingRef.current) return;
+            // Compute an impulse based on the drag velocity.
+            // (For simplicity, we use a fixed upward component.)
+            const now = performance.now();
+            const deltaTime = (now - lastDragTimeRef.current) / 1000;
+            // If deltaTime is very small, use a default small value.
+            const dt = deltaTime > 0.001 ? deltaTime : 0.02;
+            // We use the difference between the last recorded intersection and current intersection.
+            getMouseNDC(event);
+            raycaster.setFromCamera(mouse, camera);
+            const plane = dragPlaneRef.current;
+            const releasePoint = new THREE.Vector3();
+            raycaster.ray.intersectPlane(plane, releasePoint);
+            const velocity = releasePoint.clone().sub(lastDragPosRef.current).divideScalar(dt);
+            // Add a fixed upward velocity component.
+            velocity.y = Math.abs(velocity.y) + 3;
+            
+            // Restore dice mass to re-enable physics.
+            diceBody.mass = 1;
+            diceBody.updateMassProperties();
+            // Apply the computed impulse.
+            diceBody.velocity.set(velocity.x, velocity.y, velocity.z);
+            isDraggingRef.current = false;
+          }
+          
+          // Add mouse event listeners to the renderer's DOM element.
+          renderer.domElement.addEventListener("mousedown", onMouseDown);
+          renderer.domElement.addEventListener("mousemove", onMouseMove);
+          window.addEventListener("mouseup", onMouseUp);
+          
+          // --- Resize Handler ---
+          function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+          }
+          window.addEventListener("resize", onWindowResize);
+          
+          // Cleanup on unmount.
+          return () => {
+            window.removeEventListener("resize", onWindowResize);
+            renderer.domElement.removeEventListener("mousedown", onMouseDown);
+            renderer.domElement.removeEventListener("mousemove", onMouseMove);
+            window.removeEventListener("mouseup", onMouseUp);
+            mountRef.current.removeChild(renderer.domElement);
+          };
+        }, []);
+        
+        // --- Roll Dice Button Handler (for non-drag throw) ---
+        function rollDice() {
+          const body = diceBodyRef.current;
+          body.velocity.set(0, 0, 0);
+          body.angularVelocity.set(0, 0, 0);
+          body.position.set(0, 2, 0);
+          const impulse = new CANNON.Vec3(
+            (Math.random() - 0.5) * 1,
+            Math.random() * 1 + 3,
+            (Math.random() - 0.5) * 1
+          );
+          body.applyImpulse(impulse, body.position);
+        }
+        
+        // --- Helper: Create a Label Mesh ---
+        function createLabelMesh(number) {
+          const canvas = document.createElement("canvas");
+          canvas.width = 256;
+          canvas.height = 256;
+          const context = canvas.getContext("2d");
+          context.clearRect(0, 0, canvas.width, canvas.height);
+          context.font = "bold 140px sans-serif";
+          context.textAlign = "center";
+          context.textBaseline = "middle";
+          context.fillStyle = "black";
+          context.shadowColor = "rgba(255,255,255,0.7)";
+          context.shadowOffsetX = 2;
+          context.shadowOffsetY = 2;
+          context.shadowBlur = 4;
+          context.fillText(number.toString(), canvas.width / 2, canvas.height / 2);
+          
+          const texture = new THREE.CanvasTexture(canvas);
+          texture.needsUpdate = true;
+          const material = new THREE.MeshBasicMaterial({
+            map: texture,
+            transparent: true,
+            side: THREE.DoubleSide
+          });
+          const planeSize = 0.4;
+          const plane = new THREE.PlaneGeometry(planeSize, planeSize);
+          return new THREE.Mesh(plane, material);
+        }
+        
+        return (
+          <div style={{ width: "100%", height: "100%" }} ref={mountRef}>
+            <button onClick={rollDice}>Roll D20</button>
+          </div>
+        );
+      }
+      
+      ReactDOM.render(<D20Roller />, document.getElementById("root"));
+    </script>
+  </body>
+</html>
